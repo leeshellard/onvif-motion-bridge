@@ -1,0 +1,5 @@
+config.yaml
+go2rtc.yaml
+motion.token
+*.bak*
+__pycache__/

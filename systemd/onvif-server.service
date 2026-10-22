@@ -1,0 +1,12 @@
+[Unit]
+Description=Virtual ONVIF cameras (onvif-server with motion patch)
+After=network-online.target virtual-camera-routes.service
+Wants=network-online.target
+[Service]
+User=onvif
+WorkingDirectory=/opt/onvif-server
+ExecStart=/usr/bin/node /opt/onvif-server/main.js /opt/onvif-server/config.yaml
+Restart=always
+RestartSec=10
+[Install]
+WantedBy=multi-user.target

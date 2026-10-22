@@ -1,0 +1,6 @@
+patches/onvif-server-motion-events.patch modifies, and contains excerpts of, onvif-server:
+  https://github.com/daniela-hase/onvif-server
+  Copyright (c) 2024 Daniela Hasenbring
+  Released under the MIT License.
+
+The rest of this repository is released under the MIT License (see LICENSE).

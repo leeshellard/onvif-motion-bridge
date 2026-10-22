@@ -1,0 +1,17 @@
+# go2rtc re-streams each camera with a clean H.264 stream that UniFi Protect accepts.
+# Copy to /opt/go2rtc/go2rtc.yaml and put your own camera RTSP addresses in.
+streams:
+  # Re-encoded on an Intel GPU (VAAPI): clean timestamps, keyframe every second, no B-frames.
+  cam1:
+    - exec:ffmpeg -hide_banner -loglevel error -use_wallclock_as_timestamps 1 -fflags nobuffer+genpts -rtsp_transport tcp -timeout 5000000 -i rtsp://USERNAME:PASSWORD@CAMERA1_IP/live -init_hw_device vaapi=va:/dev/dri/renderD128 -filter_hw_device va -vf format=nv12,hwupload -c:v h264_vaapi -low_power 1 -g 15 -keyint_min 15 -bf 0 -profile:v high -an -rtsp_transport tcp -f rtsp {output}
+  cam2:
+    - exec:ffmpeg -hide_banner -loglevel error -use_wallclock_as_timestamps 1 -fflags nobuffer+genpts -rtsp_transport tcp -timeout 5000000 -i rtsp://USERNAME:PASSWORD@CAMERA2_IP/live -init_hw_device vaapi=va:/dev/dri/renderD128 -filter_hw_device va -vf format=nv12,hwupload -c:v h264_vaapi -low_power 1 -g 15 -keyint_min 15 -bf 0 -profile:v high -an -rtsp_transport tcp -f rtsp {output}
+  # Without a GPU, a camera that already sends clean H.264 can be passed straight through:
+  # cam1: rtsp://USERNAME:PASSWORD@CAMERA1_IP/live
+
+api:
+  listen: ":1984"      # go2rtc web UI
+rtsp:
+  listen: ":8555"      # onvif-server forwards Protect's RTSP requests here
+log:
+  level: info

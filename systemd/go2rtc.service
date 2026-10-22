@@ -1,0 +1,12 @@
+[Unit]
+Description=go2rtc camera re-streamer
+After=network-online.target
+Wants=network-online.target
+[Service]
+User=go2rtc
+WorkingDirectory=/opt/go2rtc
+ExecStart=/opt/go2rtc/go2rtc -config /opt/go2rtc/go2rtc.yaml
+Restart=always
+RestartSec=5
+[Install]
+WantedBy=multi-user.target

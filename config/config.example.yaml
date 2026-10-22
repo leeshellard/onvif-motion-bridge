@@ -1,0 +1,48 @@
+# onvif-server config: one virtual ONVIF camera per entry, each on its own network interface (MAC).
+# Copy to /opt/onvif-server/config.yaml. No camera passwords here: UniFi Protect asks for them when adopting.
+onvif:
+  - mac: aa:bb:cc:dd:ee:01            # MAC of the interface for this virtual camera (eth1)
+    ports:
+      server: 8081
+      rtsp: 8554
+    name: Camera1                       # also used by the motion API: POST /motion/Camera1
+    uuid: 00000000-0000-4000-8000-000000000001   # any unique UUID per camera (uuidgen)
+    highQuality:
+      rtsp: /cam1                       # go2rtc stream name
+      width: 1920
+      height: 1080
+      framerate: 15
+      bitrate: 2048
+      quality: 4
+    lowQuality:
+      rtsp: /cam1
+      width: 1920
+      height: 1080
+      framerate: 15
+      bitrate: 2048
+      quality: 1
+    target:
+      hostname: 127.0.0.1               # where go2rtc runs
+      ports:
+        rtsp: 8555                      # go2rtc RTSP port
+
+  - mac: aa:bb:cc:dd:ee:02            # second virtual camera (eth2)
+    ports:
+      server: 8081
+      rtsp: 8556                        # must differ from the first camera
+    name: Camera2
+    uuid: 00000000-0000-4000-8000-000000000002
+    highQuality: {rtsp: /cam2, width: 1920, height: 1080, framerate: 15, bitrate: 2048, quality: 4}
+    lowQuality:  {rtsp: /cam2, width: 1920, height: 1080, framerate: 15, bitrate: 2048, quality: 1}
+    target:
+      hostname: 127.0.0.1
+      ports:
+        rtsp: 8555
+
+# Added by the motion patch: HTTP API that raises/clears ONVIF motion events.
+# Protect the token file (chmod 600, owned by the service user).
+motionApi:
+  host: 127.0.0.1                       # use the container's LAN IP if Home Assistant should call it
+  port: 8099
+  tokenFile: /opt/onvif-server/motion.token
+  maxMotionSeconds: 120                 # motion auto-clears after this if no "off" arrives

@@ -1,0 +1,395 @@
+diff --git a/main.js b/main.js
+index dd86cfc..1152798 100644
+--- a/main.js
++++ b/main.js
+@@ -86,9 +86,11 @@ if (args) {
+         }
+ 
+         let proxies = {};
++        let servers = {}; // MOTION PATCH: by name, for the motion API
+ 
+         for (let onvifConfig of config.onvif) {
+             let server = onvifServer.createServer(onvifConfig, logger);
++            servers[onvifConfig.name] = server;
+             if (server.getHostname()) {
+                 logger.info(`Starting virtual onvif server for ${onvifConfig.name} on ${server.getHostname()}:${onvifConfig.ports.server} ...`);
+                 server.startServer();
+@@ -120,6 +122,31 @@ if (args) {
+             }
+         }
+ 
++        // MOTION PATCH: motion trigger API, e.g. POST /motion/EufyCam?state=on with "Authorization: Bearer <token>"
++        if (config.motionApi) {
++            const token = fs.readFileSync(config.motionApi.tokenFile, 'utf8').trim();
++            const maxMotion = (config.motionApi.maxMotionSeconds || 120) * 1000;
++            require('http').createServer((req, res) => {
++                const done = (code, msg) => { res.writeHead(code, { 'Content-Type': 'text/plain' }); res.end(msg + '\n'); };
++                const u = new URL(req.url, 'http://localhost');
++                const m = /^\/motion\/([^/]+)$/.exec(u.pathname);
++                if (req.method !== 'POST' || !m) return done(404, 'not found');
++                if (!token || req.headers['authorization'] !== 'Bearer ' + token) return done(401, 'unauthorized');
++                const name = decodeURIComponent(m[1]);
++                const server = servers[name];
++                if (!server) return done(404, 'unknown camera');
++                const state = u.searchParams.get('state');
++                if (state !== 'on' && state !== 'off') return done(400, 'state must be on or off');
++                const changed = server.setMotion(state === 'on');
++                logger.info(`Motion ${state} for ${name}${changed ? '' : ' (unchanged)'}`);
++                clearTimeout(server.motionTimer);
++                if (state === 'on')
++                    server.motionTimer = setTimeout(() => { if (server.setMotion(false)) logger.info(`Motion auto-cleared for ${name}`); }, maxMotion);
++                done(200, 'ok');
++            }).listen(config.motionApi.port, config.motionApi.host);
++            logger.info(`Motion API listening on ${config.motionApi.host}:${config.motionApi.port}`);
++        }
++
+     } else {
+         logger.error('Please specifiy a config filename!');
+         return -1;
+diff --git a/src/onvif-events.js b/src/onvif-events.js
+new file mode 100644
+index 0000000..4fce3a3
+--- /dev/null
++++ b/src/onvif-events.js
+@@ -0,0 +1,250 @@
++// MOTION PATCH: minimal ONVIF Events service (PullPoint + basic push Subscribe) so NVRs such as
++// UniFi Protect can receive motion events. Motion is set from outside via OnvifEvents.setMotion().
++const http = require('http');
++const url = require('url');
++
++const NS = 'xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:wsa="http://www.w3.org/2005/08/addressing" ' +
++    'xmlns:wsnt="http://docs.oasis-open.org/wsn/b-2" xmlns:wstop="http://docs.oasis-open.org/wsn/t-1" ' +
++    'xmlns:tev="http://www.onvif.org/ver10/events/wsdl" xmlns:tt="http://www.onvif.org/ver10/schema" ' +
++    'xmlns:tns1="http://www.onvif.org/ver10/topics" xmlns:xs="http://www.w3.org/2001/XMLSchema"';
++const DIALECT = 'http://www.onvif.org/ver10/tev/topicExpression/ConcreteSet';
++const MAX_SUBSCRIPTIONS = 20;
++const MAX_QUEUE = 50;
++
++function parseDuration(value, fallback) {
++    // xs:duration such as PT60S, PT1M, PT1H30M, or an absolute xs:dateTime
++    if (!value) return fallback;
++    const m = /^P(?:\d+D)?T?(?:(\d+)H)?(?:(\d+)M)?(?:(\d+(?:\.\d+)?)S)?$/.exec(value.trim());
++    if (m) return ((+m[1] || 0) * 3600 + (+m[2] || 0) * 60 + (+m[3] || 0)) * 1000 || fallback;
++    const t = Date.parse(value);
++    return isNaN(t) ? fallback : Math.max(t - Date.now(), 1000);
++}
++
++function tag(body, name) {
++    const m = new RegExp(`<(?:[\\w-]+:)?${name}\\b[^>]*>([\\s\\S]*?)</(?:[\\w-]+:)?${name}>`).exec(body);
++    return m ? m[1].trim() : null;
++}
++
++function envelope(action, body) {
++    return `<?xml version="1.0" encoding="UTF-8"?><s:Envelope ${NS}><s:Header>` +
++        `<wsa:Action>${action}</wsa:Action></s:Header><s:Body>${body}</s:Body></s:Envelope>`;
++}
++
++class OnvifEvents {
++    constructor(server) {
++        this.server = server;           // OnvifServer instance (config, logger)
++        this.subscriptions = new Map(); // id -> { expires, queue, waiter, push }
++        this.nextId = 1;
++        this.motion = false;
++        this.motionChanged = new Date();
++        setInterval(() => this.expire(), 10000).unref();
++    }
++
++    get base() {
++        return `http://${this.server.config.hostname}:${this.server.config.ports.server}`;
++    }
++
++    expire() {
++        const now = Date.now();
++        for (const [id, sub] of this.subscriptions)
++            if (sub.expires < now) this.drop(id);
++    }
++
++    drop(id) {
++        const sub = this.subscriptions.get(id);
++        if (!sub) return;
++        if (sub.waiter) sub.waiter.flush();
++        this.subscriptions.delete(id);
++    }
++
++    messages(operation) {
++        const time = this.motionChanged.toISOString();
++        const value = this.motion ? 'true' : 'false';
++        const wrap = (topic, source, data) =>
++            `<wsnt:NotificationMessage><wsnt:Topic Dialect="${DIALECT}">${topic}</wsnt:Topic><wsnt:Message>` +
++            `<tt:Message UtcTime="${time}" PropertyOperation="${operation}"><tt:Source>${source}</tt:Source>` +
++            `<tt:Data>${data}</tt:Data></tt:Message></wsnt:Message></wsnt:NotificationMessage>`;
++        return [
++            wrap('tns1:RuleEngine/CellMotionDetector/Motion',
++                '<tt:SimpleItem Name="VideoSourceConfigurationToken" Value="video_src_config_token"/>' +
++                '<tt:SimpleItem Name="VideoAnalyticsConfigurationToken" Value="va_config_token"/>' +
++                '<tt:SimpleItem Name="Rule" Value="MotionDetectorRule"/>',
++                `<tt:SimpleItem Name="IsMotion" Value="${value}"/>`),
++            wrap('tns1:VideoSource/MotionAlarm',
++                '<tt:SimpleItem Name="Source" Value="video_src_token"/>',
++                `<tt:SimpleItem Name="State" Value="${value}"/>`)
++        ];
++    }
++
++    setMotion(state) {
++        state = !!state;
++        if (state === this.motion) return false;
++        this.motion = state;
++        this.motionChanged = new Date();
++        const msgs = this.messages('Changed');
++        for (const sub of this.subscriptions.values()) {
++            if (sub.push) this.notify(sub.push, msgs);
++            else {
++                sub.queue.push(...msgs);
++                sub.queue.splice(0, Math.max(0, sub.queue.length - MAX_QUEUE));
++                if (sub.waiter) sub.waiter.flush();
++            }
++        }
++        return true;
++    }
++
++    notify(address, msgs) {
++        const body = envelope('http://docs.oasis-open.org/wsn/bw-2/NotificationConsumer/Notify',
++            `<wsnt:Notify>${msgs.join('')}</wsnt:Notify>`);
++        try {
++            const req = http.request(address, { method: 'POST', timeout: 5000,
++                headers: { 'Content-Type': 'application/soap+xml; charset=utf-8', 'Content-Length': Buffer.byteLength(body) } });
++            req.on('error', (e) => this.server.logger.warn(`${this.server.config.name}: notify ${address} failed: ${e.message}`));
++            req.on('timeout', () => req.destroy());
++            req.end(body);
++        } catch (e) {
++            this.server.logger.warn(`${this.server.config.name}: bad notify address ${address}`);
++        }
++    }
++
++    addSubscription(ttl, push) {
++        if (this.subscriptions.size >= MAX_SUBSCRIPTIONS) {
++            const oldest = [...this.subscriptions.entries()].sort((a, b) => a[1].expires - b[1].expires)[0];
++            this.drop(oldest[0]);
++        }
++        const id = String(this.nextId++);
++        // Start with the current state so the client knows where things stand.
++        this.subscriptions.set(id, { expires: Date.now() + ttl, queue: push ? [] : this.messages('Initialized'), waiter: null, push });
++        if (push) this.notify(push, this.messages('Initialized'));
++        return id;
++    }
++
++    times(sub) {
++        return `<wsnt:CurrentTime>${new Date().toISOString()}</wsnt:CurrentTime>` +
++            `<wsnt:TerminationTime>${new Date(sub.expires).toISOString()}</wsnt:TerminationTime>`;
++    }
++
++    fault(res, reason) {
++        res.writeHead(500, { 'Content-Type': 'application/soap+xml; charset=utf-8' });
++        res.end(envelope('http://www.w3.org/2005/08/addressing/soap/fault',
++            `<s:Fault><s:Code><s:Value>s:Sender</s:Value></s:Code><s:Reason><s:Text xml:lang="en">${reason}</s:Text></s:Reason></s:Fault>`));
++    }
++
++    send(res, action, body) {
++        const xml = envelope(action, body);
++        res.writeHead(200, { 'Content-Type': 'application/soap+xml; charset=utf-8', 'Content-Length': Buffer.byteLength(xml) });
++        res.end(xml);
++    }
++
++    // Returns true if the request was handled.
++    handle(req, res) {
++        const path = url.parse(req.url).pathname;
++        const subMatch = /^\/onvif\/subscription\/(\d+)$/.exec(path);
++        if (path !== '/onvif/events_service' && !subMatch) return false;
++        let body = '';
++        req.on('data', (c) => { body += c; if (body.length > 65536) req.destroy(); });
++        req.on('end', () => {
++            const m = /<(?:[\w-]+:)?Body[^>]*>\s*<(?:[\w-]+:)?(\w+)/.exec(body);
++            const op = m ? m[1] : '';
++            this.server.logger.debug(`${this.server.config.name}: events ${path} ${op}`);
++            if (subMatch) this.handleSubscription(subMatch[1], op, body, res);
++            else this.handleService(op, body, res);
++        });
++        return true;
++    }
++
++    handleService(op, body, res) {
++        const tev = 'http://www.onvif.org/ver10/events/wsdl';
++        switch (op) {
++            case 'GetServiceCapabilities':
++                return this.send(res, `${tev}/EventPortType/GetServiceCapabilitiesResponse`,
++                    '<tev:GetServiceCapabilitiesResponse><tev:Capabilities WSSubscriptionPolicySupport="false" ' +
++                    'WSPausableSubscriptionManagerInterfaceSupport="false" MaxNotificationProducers="10" MaxPullPoints="10" ' +
++                    'PersistentNotificationStorage="false"/></tev:GetServiceCapabilitiesResponse>');
++            case 'GetEventProperties': {
++                const desc = (source, data) => `<tt:MessageDescription IsProperty="true"><tt:Source>${source}</tt:Source><tt:Data>${data}</tt:Data></tt:MessageDescription>`;
++                return this.send(res, `${tev}/EventPortType/GetEventPropertiesResponse`,
++                    '<tev:GetEventPropertiesResponse>' +
++                    '<tev:TopicNamespaceLocation>http://www.onvif.org/onvif/ver10/topics/topicns.xml</tev:TopicNamespaceLocation>' +
++                    '<wsnt:FixedTopicSet>true</wsnt:FixedTopicSet><wstop:TopicSet>' +
++                    '<tns1:RuleEngine><CellMotionDetector><Motion wstop:topic="true">' +
++                    desc('<tt:SimpleItemDescription Name="VideoSourceConfigurationToken" Type="tt:ReferenceToken"/>' +
++                         '<tt:SimpleItemDescription Name="VideoAnalyticsConfigurationToken" Type="tt:ReferenceToken"/>' +
++                         '<tt:SimpleItemDescription Name="Rule" Type="xs:string"/>',
++                         '<tt:SimpleItemDescription Name="IsMotion" Type="xs:boolean"/>') +
++                    '</Motion></CellMotionDetector></tns1:RuleEngine>' +
++                    '<tns1:VideoSource><MotionAlarm wstop:topic="true">' +
++                    desc('<tt:SimpleItemDescription Name="Source" Type="tt:ReferenceToken"/>',
++                         '<tt:SimpleItemDescription Name="State" Type="xs:boolean"/>') +
++                    '</MotionAlarm></tns1:VideoSource></wstop:TopicSet>' +
++                    `<wsnt:TopicExpressionDialect>${DIALECT}</wsnt:TopicExpressionDialect>` +
++                    '<wsnt:TopicExpressionDialect>http://docs.oasis-open.org/wsn/t-1/TopicExpression/Concrete</wsnt:TopicExpressionDialect>' +
++                    '<tev:MessageContentFilterDialect>http://www.onvif.org/ver10/tev/messageContentFilter/ItemFilter</tev:MessageContentFilterDialect>' +
++                    '<tev:MessageContentSchemaLocation>http://www.onvif.org/onvif/ver10/schema/onvif.xsd</tev:MessageContentSchemaLocation>' +
++                    '</tev:GetEventPropertiesResponse>');
++            }
++            case 'CreatePullPointSubscription': {
++                const id = this.addSubscription(parseDuration(tag(body, 'InitialTerminationTime'), 60000), null);
++                const sub = this.subscriptions.get(id);
++                return this.send(res, `${tev}/EventPortType/CreatePullPointSubscriptionResponse`,
++                    `<tev:CreatePullPointSubscriptionResponse><tev:SubscriptionReference><wsa:Address>${this.base}/onvif/subscription/${id}</wsa:Address>` +
++                    `</tev:SubscriptionReference>${this.times(sub)}</tev:CreatePullPointSubscriptionResponse>`);
++            }
++            case 'Subscribe': {
++                const consumer = tag(tag(body, 'ConsumerReference') || '', 'Address');
++                if (!consumer || !/^https?:\/\//.test(consumer)) return this.fault(res, 'Missing ConsumerReference');
++                const id = this.addSubscription(parseDuration(tag(body, 'InitialTerminationTime'), 60000), consumer);
++                const sub = this.subscriptions.get(id);
++                return this.send(res, 'http://docs.oasis-open.org/wsn/bw-2/NotificationProducer/SubscribeResponse',
++                    `<wsnt:SubscribeResponse><wsnt:SubscriptionReference><wsa:Address>${this.base}/onvif/subscription/${id}</wsa:Address>` +
++                    `</wsnt:SubscriptionReference>${this.times(sub)}</wsnt:SubscribeResponse>`);
++            }
++            default:
++                return this.fault(res, `Unsupported events operation ${op}`);
++        }
++    }
++
++    handleSubscription(id, op, body, res) {
++        const sub = this.subscriptions.get(id);
++        if (!sub) return this.fault(res, 'Unknown or expired subscription');
++        const tev = 'http://www.onvif.org/ver10/events/wsdl';
++        switch (op) {
++            case 'PullMessages': {
++                const timeout = Math.min(parseDuration(tag(body, 'Timeout'), 10000), 60000);
++                const limit = Math.max(1, parseInt(tag(body, 'MessageLimit')) || 10);
++                // Keep the subscription alive while it is being polled.
++                sub.expires = Math.max(sub.expires, Date.now() + timeout + 30000);
++                const respond = () => {
++                    clearTimeout(timer);
++                    if (sub.waiter === waiter) sub.waiter = null;
++                    const msgs = sub.queue.splice(0, limit);
++                    this.send(res, `${tev}/PullPointSubscription/PullMessagesResponse`,
++                        `<tev:PullMessagesResponse><tev:CurrentTime>${new Date().toISOString()}</tev:CurrentTime>` +
++                        `<tev:TerminationTime>${new Date(sub.expires).toISOString()}</tev:TerminationTime>${msgs.join('')}</tev:PullMessagesResponse>`);
++                };
++                if (sub.waiter) sub.waiter.flush();
++                const waiter = { flush: respond };
++                const timer = setTimeout(respond, timeout);
++                if (sub.queue.length) return respond();
++                sub.waiter = waiter;
++                res.on('close', () => { clearTimeout(timer); if (sub.waiter === waiter) sub.waiter = null; });
++                return;
++            }
++            case 'Renew':
++                sub.expires = Date.now() + parseDuration(tag(body, 'TerminationTime'), 60000);
++                return this.send(res, 'http://docs.oasis-open.org/wsn/bw-2/SubscriptionManager/RenewResponse',
++                    `<wsnt:RenewResponse>${this.times(sub).replace(/(<wsnt:CurrentTime>.*?<\/wsnt:CurrentTime>)(.*)/, '$2$1')}</wsnt:RenewResponse>`);
++            case 'Unsubscribe':
++                this.drop(id);
++                return this.send(res, 'http://docs.oasis-open.org/wsn/bw-2/SubscriptionManager/UnsubscribeResponse', '<wsnt:UnsubscribeResponse/>');
++            case 'SetSynchronizationPoint':
++                if (sub.push) this.notify(sub.push, this.messages('Initialized'));
++                else { sub.queue.push(...this.messages('Initialized')); if (sub.waiter) sub.waiter.flush(); }
++                return this.send(res, `${tev}/PullPointSubscription/SetSynchronizationPointResponse`, '<tev:SetSynchronizationPointResponse/>');
++            default:
++                return this.fault(res, `Unsupported subscription operation ${op}`);
++        }
++    }
++}
++
++exports.OnvifEvents = OnvifEvents;
+diff --git a/src/onvif-server.js b/src/onvif-server.js
+index 8a4e77b..553d6f3 100644
+--- a/src/onvif-server.js
++++ b/src/onvif-server.js
+@@ -6,6 +6,7 @@ const uuid = require('node-uuid');
+ const url = require('url');
+ const fs = require('fs');
+ const os = require('os');
++const { OnvifEvents } = require('./onvif-events'); // MOTION PATCH
+ 
+ Date.prototype.stdTimezoneOffset = function() {
+     let jan = new Date(this.getFullYear(), 0, 1);
+@@ -34,6 +35,8 @@ class OnvifServer {
+         if (!this.config.hostname)
+             this.config.hostname = getIpAddressFromMac(this.config.mac);
+ 
++        this.events = new OnvifEvents(this); // MOTION PATCH: motion events
++
+         this.videoSource = {
+             attributes: {
+                 token: 'video_src_token'
+@@ -224,6 +227,15 @@ class OnvifServer {
+                                 Extension: {}
+                             };
+                         }
++                        // MOTION PATCH: advertise the Events service (PullPoint) for motion
++                        if (args.Category === undefined || args.Category == 'All' || args.Category == 'Events') {
++                            response.Capabilities['Events'] = {
++                                XAddr: `http://${this.config.hostname}:${this.config.ports.server}/onvif/events_service`,
++                                WSSubscriptionPolicySupport: false,
++                                WSPullPointSupport: true,
++                                WSPausableSubscriptionManagerInterfaceSupport: false
++                            };
++                        }
+                         if (args.Category === undefined || args.Category == 'All' || args.Category == 'Media') {
+                             response.Capabilities['Media'] = {
+                                 XAddr: `http://${this.config.hostname}:${this.config.ports.server}/onvif/media_service`,
+@@ -255,6 +267,14 @@ class OnvifServer {
+                                         Minor : 5,
+                                     }
+                                 },
++                                { // MOTION PATCH
++                                    Namespace : 'http://www.onvif.org/ver10/events/wsdl',
++                                    XAddr : `http://${this.config.hostname}:${this.config.ports.server}/onvif/events_service`,
++                                    Version : {
++                                        Major : 2,
++                                        Minor : 5,
++                                    }
++                                },
+                                 { 
+                                     Namespace : 'http://www.onvif.org/ver10/media/wsdl',
+                                     XAddr : `http://${this.config.hostname}:${this.config.ports.server}/onvif/media_service`,
+@@ -333,6 +353,7 @@ class OnvifServer {
+     }
+ 
+     listen(request, response) {
++        if (this.events.handle(request, response)) return; // MOTION PATCH
+         let action = url.parse(request.url, true).pathname;
+         if (action == '/snapshot.png') {
+             let image = fs.readFileSync('./resources/snapshot.png');
+@@ -346,7 +367,7 @@ class OnvifServer {
+     }
+ 
+     startServer() {
+-        this.server = http.createServer(this.listen);
++        this.server = http.createServer((request, response) => this.listen(request, response));
+ 
+         this.server.listen(this.config.ports.server, this.config.hostname);
+ 
+@@ -431,7 +452,9 @@ class OnvifServer {
+ 
+                     this.discoveryMessageNo++;
+                     let responseBuffer = Buffer.from(response);
+-                    return dgram.createSocket('udp4').send(responseBuffer, 0, responseBuffer.length, remote.port, remote.address);
++                    // MOTION PATCH: send the discovery reply from this virtual device's own IP (so each device has a distinct source IP/MAC)
++                    const replySocket = dgram.createSocket('udp4');
++                    return replySocket.bind(0, this.config.hostname, () => replySocket.send(responseBuffer, 0, responseBuffer.length, remote.port, remote.address, () => replySocket.close()));
+                 }
+             });
+         });
+@@ -441,6 +464,10 @@ class OnvifServer {
+         });
+     }
+ 
++    setMotion(state) { // MOTION PATCH
++        return this.events.setMotion(state);
++    }
++
+     getHostname() {
+         return this.config.hostname;
+     }

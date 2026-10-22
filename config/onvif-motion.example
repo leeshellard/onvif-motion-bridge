@@ -1,0 +1,21 @@
+# Video motion detection settings. Copy to /etc/default/onvif-motion.
+# One line per go2rtc stream: CAMERA_<stream>=<onvif-server camera name>
+CAMERA_cam1=Camera1
+CAMERA_cam2=Camera2
+
+# Where the motion API listens (motionApi in config.yaml) and its token file
+MOTION_API=http://127.0.0.1:8099
+TOKEN_FILE=/opt/onvif-server/motion.token
+
+# Shared tuning (restart onvif-motion@<stream> after changing)
+PIXEL_DIFF=25        # 0-255 brightness change for a pixel to count
+ON_PERCENT=1.0       # % of the picture that must change to count as motion
+GLOBAL_PERCENT=45    # above this the whole picture changed (lights, IR switch): ignored
+ON_FRAMES=2          # consecutive motion frames needed to start
+HOLD_SECONDS=10      # quiet time before motion stops
+
+# Per-stream overrides use a _<stream> suffix, e.g. a wide view where people look small:
+#PIXEL_DIFF_cam2=15
+#ON_PERCENT_cam2=0.4
+# Areas to ignore (trees, clock overlays) as fractions of the picture "x1,y1,x2,y2;...", 0,0 = top left
+#MASK_cam2=0.85,0,1,0.6
